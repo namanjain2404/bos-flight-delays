@@ -48,3 +48,9 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Project data (large files, downloaded by code instead)
+data/
+*.zip
+*.db
+*.sqlite
