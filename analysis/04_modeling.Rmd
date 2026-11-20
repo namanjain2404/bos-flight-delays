@@ -296,6 +296,21 @@ xgboost::xgb.importance(model = xgb_booster) %>%
        x = "Share of total gain", y = NULL)
 ```
 
+```{r save-results}
+# save the results used by the final report (report/report.Rmd)
+saveRDS(list(
+  cv = bind_rows(
+    show_best(lasso_res, metric = "roc_auc", n = 1) %>% mutate(model = "Lasso"),
+    show_best(rf_res, metric = "roc_auc", n = 1) %>%
+      mutate(model = "Random forest"),
+    show_best(xgb_res, metric = "roc_auc", n = 1) %>% mutate(model = "XGBoost")
+  ),
+  test_preds = test_preds,
+  importance = as_tibble(xgboost::xgb.importance(model = xgb_booster)),
+  test_delay_rate = mean(test$delayed == "delayed")
+), "data/model_results.rds")
+```
+
 # Interpretation
 
 **Cross-validation vs test performance.** With cross-validation grouped by
