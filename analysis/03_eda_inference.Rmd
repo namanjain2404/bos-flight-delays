@@ -1,0 +1,332 @@
+---
+title: "BOS Flight Delays: Exploratory Analysis and Inference"
+author: "Naman Jain, Yash Rahul Kava, Sanket Kothari, Jinam Shah, Sai Rishin Bussa"
+output: pdf_document
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{table}{H}
+  - \usepackage{booktabs}
+  - \usepackage{etoolbox}
+  - \BeforeBeginEnvironment{Shaded}{\par\noindent\begin{minipage}{\linewidth}}
+  - \AfterEndEnvironment{Shaded}{\end{minipage}\par\medskip}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5,
+                      out.width = "100%", fig.align = "center")
+# run all paths from the project folder, not the analysis/ folder
+knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r packages}
+library(tidyverse)
+library(scales)
+library(broom)
+library(DBI)
+library(RSQLite)
+
+theme_set(theme_minimal(base_size = 11))
+```
+
+# Data
+
+The data are all scheduled departures from Boston Logan (BOS) between
+September 2025 and August 2026 from the BTS Reporting Carrier On-Time
+Performance data, joined to hourly NOAA LCDv2 weather observations at the
+scheduled departure hour (see `scripts/01_download_data.R` and
+`scripts/02_build_database.R`). The joined table is read from the project's
+SQLite database.
+
+```{r load}
+con <- dbConnect(SQLite(), "data/bos_flights.sqlite")
+
+fw <- dbGetQuery(con, "SELECT * FROM flights_weather")
+
+dbGetQuery(con, "
+  SELECT COUNT(*) AS scheduled,
+         SUM(cancelled) AS cancelled,
+         SUM(diverted) AS diverted,
+         SUM(temp_c IS NULL) AS no_weather
+  FROM flights_weather
+")
+
+dbDisconnect(con)
+```
+
+For the delay analysis we use **operated flights** only (not cancelled or
+diverted, since they have no valid departure delay) that have weather data.
+The 646 flights without weather fall in a gap in NOAA's hourly reports
+(2025-09-01 04:00 to 2025-09-02 12:00, local standard time).
+
+```{r operated}
+op <- fw %>%
+  filter(cancelled == 0, diverted == 0, !is.na(temp_c)) %>%
+  mutate(
+    hour_block = cut(crs_dep_hour, breaks = c(0, 9, 12, 15, 18, 24),
+                     right = FALSE,
+                     labels = c("Before 9:00", "9:00-11:59", "12:00-14:59",
+                                "15:00-17:59", "18:00 and later")),
+    month = factor(month, levels = 1:12, labels = month.abb),
+    low_vis = as.integer(visibility_km < 5),
+    low_ceiling = as.integer(!is.na(ceiling_m) & ceiling_m < 300),
+    strong_wind = as.integer(wind_speed_ms >= 10)
+  )
+
+nrow(op)
+mean(op$dep_del15)
+```
+
+# Exploratory analysis
+
+## Delays build up over the day
+
+```{r hour, fig.height = 4}
+op %>%
+  group_by(crs_dep_hour) %>%
+  summarise(n = n(), rate = mean(dep_del15)) %>%
+  filter(n >= 100) %>%
+  ggplot(aes(crs_dep_hour, rate)) +
+  geom_line(colour = "grey60") +
+  geom_point(aes(size = n), colour = "#2c7fb8") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(5, 22, by = 2)) +
+  scale_size_area(max_size = 4, labels = comma) +
+  labs(title = "Share of BOS departures delayed 15+ minutes, by scheduled hour",
+       subtitle = "Operated flights, Sep 2025 - Aug 2026 (hours with 100+ flights)",
+       x = "Scheduled departure hour (local time)", y = "Delayed 15+ min",
+       size = "Flights")
+```
+
+## Seasonal pattern: delays and cancellations by month
+
+```{r month, fig.height = 4.6}
+by_month <- fw %>%
+  mutate(month = factor(month, levels = 1:12, labels = month.abb)) %>%
+  group_by(month) %>%
+  summarise(`Cancelled` = mean(cancelled),
+            `Delayed 15+ min (operated flights)` =
+              mean(dep_del15[cancelled == 0 & diverted == 0], na.rm = TRUE)) %>%
+  pivot_longer(-month, names_to = "measure", values_to = "rate")
+
+ggplot(by_month, aes(month, rate, fill = measure)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~ measure, ncol = 1, scales = "free_y") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("#d95f02", "#2c7fb8"), guide = "none") +
+  labs(title = "Delays and cancellations by month",
+       x = NULL, y = NULL)
+```
+
+## Carriers
+
+```{r carrier, fig.height = 4.4}
+op %>%
+  group_by(carrier_name) %>%
+  summarise(n = n(), rate = mean(dep_del15)) %>%
+  filter(n >= 500) %>%
+  mutate(se = sqrt(rate * (1 - rate) / n),
+         carrier_name = fct_reorder(carrier_name, rate)) %>%
+  ggplot(aes(rate, carrier_name)) +
+  geom_vline(xintercept = mean(op$dep_del15), linetype = "dashed",
+             colour = "grey50") +
+  geom_errorbarh(aes(xmin = rate - 1.96 * se, xmax = rate + 1.96 * se),
+                 height = 0.3, colour = "grey40") +
+  geom_point(aes(size = n), colour = "#2c7fb8") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_size_area(max_size = 4, labels = comma) +
+  labs(title = "Delay rate by carrier (95% confidence intervals)",
+       subtitle = "Carriers with 500+ operated BOS departures; dashed = overall rate",
+       x = "Delayed 15+ min", y = NULL, size = "Flights")
+```
+
+## Causes of delay
+
+BTS splits the delay minutes of each delayed flight into five causes, stored
+in five separate columns. We reshape them into a long format (one row per
+flight and cause) to compare the causes.
+
+```{r causes, fig.height = 3.2}
+fw %>%
+  filter(cancelled == 0, dep_del15 == 1) %>%
+  select(carrier_delay, weather_delay, nas_delay, security_delay,
+         late_aircraft_delay) %>%
+  pivot_longer(everything(), names_to = "cause", values_to = "minutes") %>%
+  group_by(cause) %>%
+  summarise(minutes = sum(minutes, na.rm = TRUE)) %>%
+  mutate(share = minutes / sum(minutes),
+         cause = recode(cause, carrier_delay = "Carrier",
+                        weather_delay = "Extreme weather",
+                        nas_delay = "National Aviation System",
+                        security_delay = "Security",
+                        late_aircraft_delay = "Late-arriving aircraft"),
+         cause = fct_reorder(cause, share)) %>%
+  ggplot(aes(share, cause)) +
+  geom_col(fill = "#2c7fb8", width = 0.6) +
+  geom_text(aes(label = percent(share, accuracy = 0.1)), hjust = -0.15,
+            size = 3.3) +
+  scale_x_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 0.55)) +
+  labs(title = "Share of delay minutes by cause (delayed departures)",
+       x = "Share of delay minutes", y = NULL)
+```
+
+## Weather conditions
+
+```{r weather, fig.height = 4.6}
+conditions <- c(any_precip = "Any precipitation", rain = "Rain",
+                snow = "Snow", fog_mist = "Fog or mist",
+                low_vis = "Visibility < 5 km", low_ceiling = "Ceiling < 300 m",
+                strong_wind = "Wind >= 10 m/s", thunder = "Thunderstorm")
+
+weather_rates <- op %>%
+  select(dep_del15, all_of(names(conditions))) %>%
+  pivot_longer(-dep_del15, names_to = "condition", values_to = "present") %>%
+  group_by(condition, present) %>%
+  summarise(n = n(), rate = mean(dep_del15), .groups = "drop") %>%
+  mutate(se = sqrt(rate * (1 - rate) / n),
+         condition = factor(conditions[condition], levels = rev(conditions)),
+         present = if_else(present == 1, "Condition present",
+                           "Condition absent"))
+
+ggplot(weather_rates, aes(rate, condition, colour = present)) +
+  geom_errorbarh(aes(xmin = rate - 1.96 * se, xmax = rate + 1.96 * se),
+                 height = 0.25) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c("Condition absent" = "grey50",
+                                 "Condition present" = "#d95f02")) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Delay rate when each weather condition is present or absent",
+       subtitle = "Weather at the scheduled departure hour; 95% confidence intervals",
+       x = "Delayed 15+ min", y = NULL, colour = NULL) +
+  theme(legend.position = "top")
+
+weather_rates %>%
+  select(condition, present, n, rate) %>%
+  pivot_wider(names_from = present, values_from = c(n, rate)) %>%
+  select(condition, `n_Condition present`, `rate_Condition present`,
+         `n_Condition absent`, `rate_Condition absent`) %>%
+  knitr::kable(format = "latex", booktabs = TRUE, digits = 3,
+               format.args = list(big.mark = ","),
+               col.names = c("Condition", "Flights (present)",
+                             "Delay rate (present)", "Flights (absent)",
+                             "Delay rate (absent)"),
+               caption = "Delay rate by weather condition")
+```
+
+# Statistical inference
+
+## Precipitation vs dry hours
+
+H0: the delay rate is the same for departures with and without
+precipitation at the scheduled departure hour. HA: the rates differ.
+alpha = 0.05.
+
+```{r prop-test}
+precip_counts <- op %>%
+  group_by(any_precip) %>%
+  summarise(delayed = sum(dep_del15), n = n()) %>%
+  arrange(desc(any_precip))
+
+prop.test(precip_counts$delayed, precip_counts$n)
+```
+
+## Carriers
+
+H0: the delay rate is the same for all carriers. HA: at least one carrier
+differs. alpha = 0.05.
+
+```{r chisq}
+chisq.test(table(op$carrier, op$dep_del15))
+```
+
+## Logistic regression
+
+To check whether the weather effects remain after accounting for time of
+day, season and carrier, we fit a logistic regression for the probability
+of a 15+ minute delay. Odds ratios with 95% Wald confidence intervals are
+shown below (reference levels: departures before 9:00, January, and
+American Airlines).
+
+```{r logit}
+logit <- glm(dep_del15 ~ hour_block + month + carrier + any_precip + snow +
+               fog_mist + low_vis + wind_speed_ms,
+             data = op, family = binomial)
+
+or_table <- tidy(logit) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(odds_ratio = exp(estimate),
+         conf_low = exp(estimate - 1.96 * std.error),
+         conf_high = exp(estimate + 1.96 * std.error),
+         group = case_when(str_detect(term, "hour_block") ~ "Time of day",
+                           str_detect(term, "month") ~ "Month",
+                           str_detect(term, "carrier") ~ "Carrier",
+                           TRUE ~ "Weather"),
+         term = str_remove(term, "hour_block|month|carrier"))
+```
+
+```{r logit-plot, fig.height = 5}
+or_table %>%
+  filter(group %in% c("Weather", "Time of day")) %>%
+  mutate(term = recode(term, any_precip = "Any precipitation",
+                       snow = "Snow (in addition)",
+                       fog_mist = "Fog or mist",
+                       low_vis = "Visibility < 5 km",
+                       wind_speed_ms = "Wind speed (per m/s)")) %>%
+  ggplot(aes(odds_ratio, fct_rev(fct_inorder(term)))) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(aes(xmin = conf_low, xmax = conf_high), height = 0.25) +
+  geom_point(colour = "#d95f02", size = 2.5) +
+  facet_wrap(~ group, ncol = 1, scales = "free") +
+  scale_x_log10() +
+  labs(title = "Adjusted odds ratios for a 15+ minute delay",
+       subtitle = paste("Logistic regression adjusted for time of day, month",
+                        "and carrier; 95% CIs (log scale)"),
+       x = "Odds ratio", y = NULL)
+```
+
+```{r logit-table}
+or_table %>%
+  filter(group == "Weather") %>%
+  select(term, odds_ratio, conf_low, conf_high, p.value) %>%
+  mutate(p.value = pvalue(p.value),
+         term = recode(term, any_precip = "Any precipitation",
+                       snow = "Snow (in addition)", fog_mist = "Fog or mist",
+                       low_vis = "Visibility < 5 km",
+                       wind_speed_ms = "Wind speed (per m/s)")) %>%
+  knitr::kable(format = "latex", booktabs = TRUE, digits = 3,
+               col.names = c("Variable", "Odds ratio", "95% CI low",
+                             "95% CI high", "p-value"),
+               caption = "Adjusted odds ratios for weather variables")
+```
+
+# Summary of findings
+
+- **Overall:** of the 138,743 operated departures with weather data, 24.2%
+  left 15 or more minutes late; 3.05% of all scheduled departures were
+  cancelled.
+- **Time of day:** the delay rate rises steadily from about 7-10% for
+  departures before 8:00 to about 44% for departures from 19:00 onward.
+  Late-arriving aircraft cause 46.9% of all delay minutes, consistent with
+  delays propagating through the day.
+- **Season:** delays peak in July and August (28-30%) and in September,
+  October and December; cancellations are highest in January and February
+  (7.5-8.2%) and July (5.9%).
+- **Carriers:** delay rates differ significantly between carriers
+  (chi-square test, p < 0.001). Among the large carriers, United has the
+  lowest rate (19.0%) and Southwest (36.2%) and Spirit (38.0%) the highest;
+  JetBlue, the largest carrier at BOS, is at 28.8%. Allegiant has an even
+  lower rate (14.4%), but with only 578 departures.
+- **Weather:** departures during precipitation were delayed 36.3% of the
+  time versus 22.2% in dry conditions, a difference of 14.1 percentage points
+  (95% CI 13.4 to 14.9; p < 0.001). After adjusting for time of day, month
+  and carrier, precipitation still increases the odds of a delay by about
+  80% (OR 1.80), with additional increases for snow, fog or mist, low
+  visibility and stronger wind. Although BTS attributes only 2.7% of delay
+  minutes to "extreme weather", ordinary weather is largely recorded under
+  National Aviation System delays (20.0% of delay minutes), so weather
+  matters more than that category alone suggests.
+
+These results motivate the predictive models: scheduled hour, month, carrier
+and the weather variables at the scheduled departure hour all carry
+information about the delay risk and are known before departure.
