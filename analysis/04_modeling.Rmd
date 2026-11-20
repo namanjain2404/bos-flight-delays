@@ -1,0 +1,344 @@
+---
+title: "BOS Flight Delays: Predictive Modeling"
+author: "Naman Jain, Yash Rahul Kava, Sanket Kothari, Jinam Shah, Sai Rishin Bussa"
+output: pdf_document
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{table}{H}
+  - \usepackage{booktabs}
+  - \usepackage{etoolbox}
+  - \BeforeBeginEnvironment{Shaded}{\par\noindent\begin{minipage}{\linewidth}}
+  - \AfterEndEnvironment{Shaded}{\end{minipage}\par\medskip}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5,
+                      out.width = "100%", fig.align = "center")
+knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r packages}
+library(tidyverse)
+library(tidymodels)
+library(DBI)
+library(RSQLite)
+
+theme_set(theme_minimal(base_size = 11))
+tidymodels_prefer()
+```
+
+# Goal
+
+We predict whether a scheduled departure from BOS will leave **15 or more
+minutes late**, using only information that is available before departure:
+the schedule (hour, day of week), the carrier and destination, the distance,
+the proximity to a federal holiday, and the weather observed at BOS just
+before the scheduled departure hour.
+
+# Data
+
+```{r load}
+con <- dbConnect(SQLite(), "data/bos_flights.sqlite")
+
+model_data <- dbGetQuery(con, "
+  SELECT flight_date, crs_dep_hour, day_of_week, carrier, dest, distance,
+         temp_c, dew_point_c, rel_humidity, visibility_km, wind_speed_ms,
+         wind_gust_ms, precip_mm, rain, snow, fog_mist, thunder, any_precip,
+         dep_del15
+  FROM flights_weather
+  WHERE cancelled = 0 AND diverted = 0 AND temp_c IS NOT NULL
+")
+
+dbDisconnect(con)
+```
+
+```{r features}
+# U.S. federal holidays in the study period
+holidays <- as.Date(c("2025-09-01", "2025-10-13", "2025-11-11",
+                      "2025-11-27", "2025-12-25", "2026-01-01",
+                      "2026-01-19", "2026-02-16", "2026-05-25",
+                      "2026-06-19", "2026-07-04"))
+
+model_data <- model_data %>%
+  mutate(
+    flight_date = as.Date(flight_date),
+    delayed = factor(if_else(dep_del15 == 1, "delayed", "on_time"),
+                     levels = c("delayed", "on_time")),
+    day_of_week = factor(day_of_week, levels = 1:7,
+                         labels = c("Mon", "Tue", "Wed", "Thu", "Fri",
+                                    "Sat", "Sun")),
+    days_to_holiday = map_dbl(flight_date,
+                              \(d) min(abs(as.numeric(d - holidays)))),
+    days_to_holiday = pmin(days_to_holiday, 7)
+  ) %>%
+  select(-dep_del15)
+
+nrow(model_data)
+```
+
+## Time-based split
+
+To mimic real use (predicting future flights), we train on the earlier
+months and test on the last three months instead of splitting at random.
+
+```{r split}
+train <- filter(model_data, flight_date < as.Date("2026-06-01"))
+test <- filter(model_data, flight_date >= as.Date("2026-06-01"))
+
+split <- make_splits(train, test)
+
+tibble(set = c("Training (Sep 2025 - May 2026)", "Test (Jun - Aug 2026)"),
+       flights = c(nrow(train), nrow(test)),
+       delay_rate = c(mean(train$delayed == "delayed"),
+                      mean(test$delayed == "delayed"))) %>%
+  knitr::kable(format = "latex", booktabs = TRUE, digits = 3,
+               format.args = list(big.mark = ","),
+               caption = "Training and test sets")
+
+# Flights on the same day share the same weather and the same daily
+# disruptions, so a random split would put very similar flights in both the
+# analysis and assessment sets. We therefore keep each day together in one
+# fold (grouped cross-validation by date).
+set.seed(5110)
+folds <- group_vfold_cv(train, group = flight_date, v = 5)
+```
+
+## Preprocessing recipe
+
+```{r recipe}
+rec <- recipe(delayed ~ crs_dep_hour + day_of_week + carrier + dest +
+                distance + days_to_holiday + temp_c + dew_point_c +
+                rel_humidity + visibility_km + wind_speed_ms + wind_gust_ms +
+                precip_mm + rain + snow + fog_mist + thunder + any_precip,
+              data = train) %>%
+  step_novel(carrier, dest) %>%                      # levels unseen in training
+  step_other(carrier, dest, threshold = 0.005) %>%   # pool rare categories
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+# Models
+
+We compare four models: a majority-class baseline, L1-regularized (lasso)
+logistic regression, a random forest and gradient-boosted trees (XGBoost).
+Hyperparameters are tuned with 5-fold cross-validation on the training set,
+grouped by date, using ROC-AUC as the selection metric.
+
+```{r specs}
+base_spec <- null_model() %>%
+  set_engine("parsnip") %>%
+  set_mode("classification")
+
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+
+rf_spec <- rand_forest(trees = 300, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity",
+             num.threads = parallel::detectCores()) %>%
+  set_mode("classification")
+
+xgb_spec <- boost_tree(trees = 500, tree_depth = tune(),
+                       learn_rate = tune()) %>%
+  set_engine("xgboost", nthread = parallel::detectCores()) %>%
+  set_mode("classification")
+
+metrics <- metric_set(roc_auc, pr_auc)
+```
+
+```{r tune, cache = TRUE, dependson = c("split", "recipe", "specs")}
+set.seed(5110)
+lasso_res <- tune_grid(workflow(rec, lasso_spec), resamples = folds,
+                       grid = grid_regular(penalty(c(-5, -1)), levels = 10),
+                       metrics = metrics)
+
+set.seed(5110)
+rf_res <- tune_grid(workflow(rec, rf_spec), resamples = folds,
+                    grid = grid_regular(mtry(c(3, 15)), min_n(c(10, 40)),
+                                        levels = 2),
+                    metrics = metrics)
+
+set.seed(5110)
+xgb_res <- tune_grid(workflow(rec, xgb_spec), resamples = folds,
+                     grid = grid_regular(tree_depth(c(3, 6)),
+                                         learn_rate(c(-2, -1)),
+                                         levels = c(2, 3)),
+                     metrics = metrics)
+```
+
+```{r cv-results}
+bind_rows(
+  show_best(lasso_res, metric = "roc_auc", n = 1) %>% mutate(model = "Lasso"),
+  show_best(rf_res, metric = "roc_auc", n = 1) %>%
+    mutate(model = "Random forest"),
+  show_best(xgb_res, metric = "roc_auc", n = 1) %>% mutate(model = "XGBoost")
+) %>%
+  select(model, mean, std_err) %>%
+  knitr::kable(format = "latex", booktabs = TRUE, digits = 4,
+               col.names = c("Model", "CV ROC-AUC", "Std. error"),
+               caption = "Best cross-validated ROC-AUC on the training set")
+```
+
+# Evaluation on the test set (Jun - Aug 2026)
+
+Each tuned model is refit on the full training set and evaluated once on the
+test months.
+
+```{r final, cache = TRUE, dependson = c("split", "recipe", "specs", "tune")}
+final_fit <- function(res, spec) {
+  workflow(rec, spec) %>%
+    finalize_workflow(select_best(res, metric = "roc_auc")) %>%
+    last_fit(split, metrics = metrics)
+}
+
+fits <- list(
+  "Baseline" = last_fit(workflow(rec, base_spec), split, metrics = metrics),
+  "Lasso" = final_fit(lasso_res, lasso_spec),
+  "Random forest" = final_fit(rf_res, rf_spec),
+  "XGBoost" = final_fit(xgb_res, xgb_spec)
+)
+
+test_preds <- imap_dfr(fits, \(f, name) collect_predictions(f) %>%
+                         mutate(model = name))
+```
+
+```{r test-metrics}
+test_preds %>%
+  group_by(model) %>%
+  summarise(roc_auc = roc_auc_vec(delayed, .pred_delayed),
+            pr_auc = pr_auc_vec(delayed, .pred_delayed)) %>%
+  # a constant (no-skill) prediction has a PR-AUC equal to the share of
+  # delayed flights; yardstick's value for a constant score is not meaningful
+  mutate(pr_auc = if_else(model == "Baseline",
+                          mean(test$delayed == "delayed"), pr_auc)) %>%
+  arrange(desc(roc_auc)) %>%
+  knitr::kable(format = "latex", booktabs = TRUE, digits = 3,
+               col.names = c("Model", "ROC-AUC", "PR-AUC"),
+               caption = "Test-set performance (Jun - Aug 2026)")
+```
+
+```{r roc, fig.height = 4.6}
+test_preds %>%
+  filter(model != "Baseline") %>%
+  group_by(model) %>%
+  roc_curve(delayed, .pred_delayed) %>%
+  ggplot(aes(1 - specificity, sensitivity, colour = model)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_path(linewidth = 0.9) +
+  coord_equal() +
+  labs(title = "ROC curves on the test set (Jun - Aug 2026)",
+       subtitle = "Dashed line = random guessing (baseline)",
+       x = "False positive rate", y = "True positive rate (recall)",
+       colour = NULL) +
+  theme(legend.position = "top")
+```
+
+## Precision and recall at a decision threshold
+
+Because only about a quarter of departures are delayed, the default 0.5
+threshold flags very few flights. We therefore also report results at a
+threshold of 0.30, close to the delay rate in the training data.
+
+```{r thresholds}
+threshold_metrics <- function(preds, thr) {
+  preds %>%
+    mutate(pred = factor(if_else(.pred_delayed >= thr, "delayed", "on_time"),
+                         levels = c("delayed", "on_time"))) %>%
+    summarise(threshold = thr,
+              accuracy = accuracy_vec(delayed, pred),
+              precision = precision_vec(delayed, pred),
+              recall = recall_vec(delayed, pred),
+              f1 = f_meas_vec(delayed, pred))
+}
+
+test_preds %>%
+  filter(model != "Baseline") %>%
+  group_by(model) %>%
+  group_modify(\(df, key) bind_rows(threshold_metrics(df, 0.5),
+                                    threshold_metrics(df, 0.3))) %>%
+  ungroup() %>%
+  knitr::kable(format = "latex", booktabs = TRUE, digits = 3,
+               col.names = c("Model", "Threshold", "Accuracy", "Precision",
+                             "Recall", "F1"),
+               caption = "Classification metrics at two thresholds (test set)")
+```
+
+```{r confusion}
+best_model <- test_preds %>%
+  filter(model != "Baseline") %>%
+  group_by(model) %>%
+  summarise(auc = roc_auc_vec(delayed, .pred_delayed)) %>%
+  slice_max(auc) %>%
+  pull(model)
+
+best_model
+
+test_preds %>%
+  filter(model == best_model) %>%
+  mutate(pred = factor(if_else(.pred_delayed >= 0.3, "delayed", "on_time"),
+                       levels = c("delayed", "on_time"))) %>%
+  conf_mat(delayed, pred)
+```
+
+## Feature importance
+
+```{r importance, fig.height = 4.6}
+# gain-based importance from the fitted XGBoost model
+xgb_booster <- extract_fit_engine(fits[["XGBoost"]])
+
+xgboost::xgb.importance(model = xgb_booster) %>%
+  as_tibble() %>%
+  slice_max(Gain, n = 15) %>%
+  ggplot(aes(Gain, fct_reorder(Feature, Gain))) +
+  geom_col(fill = "#2c7fb8", width = 0.7) +
+  labs(title = "Top 15 features (XGBoost, gain-based importance)",
+       x = "Share of total gain", y = NULL)
+```
+
+# Interpretation
+
+**Cross-validation vs test performance.** With cross-validation grouped by
+date, the cross-validated ROC-AUC on the training months (0.723 for the
+lasso, 0.740 for the random forest and 0.742 for XGBoost) is close to the
+ROC-AUC on the test months (0.743, 0.733 and 0.745). An earlier version that
+used ordinary random folds gave much higher cross-validated values for the
+tree models (about 0.78) that did not hold up on the test set. Because flights
+on the same day share the same weather and disruptions, random folds let the
+tree models partly memorize individual days. Grouping by date gives honest
+estimates and is the approach we use.
+
+**Model comparison.** All three models perform far better than the
+majority-class baseline (ROC-AUC 0.5). XGBoost has the highest test ROC-AUC
+(0.745) and PR-AUC (0.543, about twice the no-skill value of 0.266), but the
+differences between the models are small: the lasso logistic regression is
+only 0.002 lower in ROC-AUC. A simple, interpretable linear model therefore
+captures most of the predictable signal, and the tree models add little.
+
+**Decision threshold.** At the default threshold of 0.5 the models flag few
+flights as delayed (recall of 10.5% for the lasso and 30.0% for XGBoost),
+because delays are the minority class. At a threshold of 0.3, XGBoost
+identifies 53.4% of the delayed flights (recall), and 50.7% of the flights it
+flags are actually delayed (precision). In the test months, this means 5,318
+of the 9,968 delayed departures are flagged, along with 5,172 on-time
+departures. Accuracy is a poor guide here: XGBoost's accuracy of 73.8% is
+barely above the 73.4% that would be obtained by always predicting "on time".
+
+**Important features.** The scheduled departure hour is by far the most
+important feature, accounting for roughly 40% of XGBoost's total gain. This
+agrees with the exploratory analysis, where the delay rate rose from under
+10% in the early morning to over 40% in the evening as delays propagate
+through the day. Weather variables follow (relative humidity, temperature,
+dew point and visibility), together with distance, proximity to a holiday and
+the carriers with the highest delay rates (Southwest, JetBlue and Spirit).
+
+**Limitations.** First, the models cannot use month, because the summer test
+months do not appear in the training data, and the test period had a higher
+delay rate (26.6%) than the training period (23.3%). Second, late-arriving
+aircraft cause almost half of all delay minutes, but the models have no
+information on whether the inbound aircraft is late; adding the delay of each
+aircraft's previous flight (via its tail number) is likely the largest
+possible improvement. Third, the weather is measured only at BOS, so weather
+at the destination or elsewhere in the national system is not captured.
+Finally, the analysis covers a single airport and a single year.
+
