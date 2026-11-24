@@ -8,20 +8,16 @@ DS 5110 – Essentials of Data Science, Northeastern University (Fall 2026)
 
 Flight delays impose substantial costs on airlines, airports and passengers, and departures from
 congested hubs such as Boston Logan International Airport (BOS) are exposed both to weather and to
-delays that propagate through the day. We combined Bureau of Transportation Statistics on-time data
-for all 144,174 scheduled BOS departures between September 2025 and August 2026 with hourly NOAA
-weather observations at BOS, stored in a relational SQLite database. Overall, 3.05% of departures
-were cancelled and 24.2% of operated departures left 15 or more minutes late. The delay rate rose
-from under 10% in the early morning to over 40% in the evening, and late-arriving aircraft caused
-46.9% of all delay minutes. Departures during precipitation were delayed 36.3% of the time compared
-with 22.2% in dry conditions (difference 14.1 percentage points, 95% CI 13.4 to 14.9), and the
-effect remained after adjusting for time of day, month and carrier (odds ratio 1.80). Using only
-information available before departure, we trained lasso logistic regression, random forest and
-XGBoost classifiers on September 2025 to May 2026 and evaluated them on June to August 2026. XGBoost
-achieved the best test ROC-AUC (0.745) and PR-AUC (0.543, versus 0.266 for a no-skill model), with
-lasso logistic regression close behind (0.743). Scheduled departure hour was by far the most
-important predictor. We also show that cross-validation must be grouped by date: random folds
-overstated tree-model performance because flights on the same day share weather and disruptions.
+delays that build up over the day. This project set out to describe when and why departures from BOS
+are delayed, to measure how much weather increases the risk of a delay, and to predict delays before
+departure. We combined official U.S. on-time records for all 144,174 scheduled BOS departures between
+September 2025 and August 2026 with hourly weather observations at the airport. About one in four
+operated departures left at least 15 minutes late, and the risk rose sharply over the day, from under
+10% in the early morning to over 40% in the evening. Precipitation increased the delay rate from 22%
+to 36%, an effect that remained after accounting for time of day, season and airline. Machine
+learning models trained on earlier months identified about half of the delayed flights in the
+following summer, with a simple regularized logistic regression performing almost as well as
+gradient-boosted trees. The time of day was by far the most important predictor.
 
 ## Data sources
 
