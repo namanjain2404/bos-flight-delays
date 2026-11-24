@@ -1,0 +1,463 @@
+---
+title: "Predicting Departure Delays at Boston Logan International Airport Using Flight and Weather Data"
+author: "Naman Jain, Yash Rahul Kava, Sanket Kothari, Jinam Shah, Sai Rishin Bussa"
+output: pdf_document
+fontsize: 11pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{table}{H}
+  - \usepackage{booktabs}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 2.8, fig.pos = "H",
+                      out.width = "100%", fig.align = "center")
+knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r load-data, include=FALSE}
+# root.dir only applies from the next chunk on, so data are loaded here
+library(tidyverse)
+library(scales)
+library(DBI)
+library(RSQLite)
+library(yardstick)
+
+theme_set(theme_minimal(base_size = 10))
+options(knitr.kable.NA = "n/a")
+
+con <- dbConnect(SQLite(), "data/bos_flights.sqlite")
+fw <- dbGetQuery(con, "SELECT * FROM flights_weather")
+dbDisconnect(con)
+
+op <- fw %>% filter(cancelled == 0, diverted == 0, !is.na(temp_c))
+res <- readRDS("data/model_results.rds")
+```
+
+**GitHub repository:** https://github.com/namanjain2404/bos-flight-delays
+
+## Abstract
+
+Flight delays impose substantial costs on airlines, airports and passengers,
+and departures from congested hubs such as Boston Logan International Airport
+(BOS) are exposed both to weather and to delays that build up over the day.
+This project set out to describe when and why departures from BOS are
+delayed, to measure how much weather increases the risk of a delay, and to
+predict delays before departure. We combined official U.S. on-time records
+for all 144,174 scheduled BOS departures between September 2025 and August
+2026 with hourly weather observations at the airport. About one in four
+operated departures left at least 15 minutes late, and the risk rose sharply
+over the day, from under 10% in the early morning to over 40% in the evening.
+Precipitation increased the delay rate from 22% to 36%, an effect that
+remained after accounting for time of day, season and airline. Machine
+learning models trained on earlier months identified about half of the
+delayed flights in the following summer, with a simple regularized logistic
+regression performing almost as well as gradient-boosted trees. The time of
+day was by far the most important predictor.
+
+\newpage
+
+# Introduction
+
+A flight is officially considered delayed when it departs 15 or more minutes
+after its scheduled time. Delays are costly for airlines (crew and aircraft
+schedules), for airports (gate and runway congestion) and for passengers
+(missed connections and lost time). Boston Logan is a busy hub in a region
+with frequent rain, fog and winter storms, so both weather and the knock-on
+effect of earlier delays are plausible drivers of departure delays. Knowing
+which flights are most at risk, and how strongly weather matters, can help
+travelers choose flights and help airlines and airports plan resources.
+
+The **domain problem** is to understand and anticipate departure delays at
+BOS. We translated it into three **analytic problems**: (1) describe how the
+share of delayed departures varies with the time of day, season, airline and
+the causes reported for delays; (2) test whether weather at the departure
+hour (precipitation, snow, fog, low visibility and wind) is associated with a
+higher delay rate, before and after adjusting for time of day, month and
+airline; and (3) build and evaluate classifiers that predict whether a
+departure will be delayed by 15 or more minutes using only information
+available before departure.
+
+# Methods
+
+## Data collection and storage
+
+Flight data come from the Bureau of Transportation Statistics (BTS) Reporting
+Carrier On-Time Performance table [1], which records every domestic flight of
+the major U.S. carriers, including scheduled and actual times, delay causes,
+cancellations and diversions. We downloaded the twelve monthly national files
+for September 2025 to August 2026 with an R script and kept only departures
+from BOS, giving 144,174 scheduled departures by 12 carriers. Weather data
+come from NOAA's Local Climatological Data version 2 (LCDv2) [2] for the
+Boston Logan station (USW00014739). We used only the routine hourly reports
+(report type FM-15, issued at about 54 minutes past each hour) and extracted
+temperature, dew point, relative humidity, visibility, wind speed and gusts,
+precipitation, the cloud ceiling, and indicators for rain, snow, fog or mist
+and thunderstorms from the present-weather codes. Non-numeric codes required
+recoding: "T" (trace precipitation) was treated as no measurable amount but
+kept as a separate flag, and quality flags appended to values were removed.
+
+All data were stored in a SQLite database with separate tables for flights,
+hourly weather, carriers and destination airports, and joined with a SQL
+query. Joining required care with time zones: BTS times are local clock
+times that follow daylight saving time, whereas NOAA reports all times in
+local standard time (UTC-5) all year, which we verified from the original
+weather report time stamps. We therefore converted each scheduled departure
+to local standard time and attached the weather report from just before the
+scheduled departure hour. Of the 8,761 hours in the study period, 178 had no
+hourly report; short gaps were filled with the previous hour's conditions,
+but a gap in NOAA's data from August 29 to September 2, 2025 left 646 flights
+(0.45%) without weather, and these were excluded from the weather analysis
+and models. Cancelled (3.05%) and diverted flights have no valid departure
+delay and were analyzed separately, leaving 138,743 operated departures with
+weather for the delay analysis. BTS stores the minutes attributed to five
+delay causes in separate columns, which we reshaped to a long format to
+compare causes.
+
+## Statistical inference
+
+We compared the delay rate between departures with and without precipitation
+with a two-sample test of proportions and a 95% confidence interval for the
+difference, and tested whether delay rates differ between carriers with a
+chi-square test of independence (alpha = 0.05). Because weather is correlated
+with time of day and season, we also fitted a logistic regression for the
+probability of a delay with indicators for precipitation, snow, fog or mist
+and visibility below 5 km, wind speed, five departure-time blocks, month and
+carrier, and report adjusted odds ratios with 95% Wald confidence intervals.
+
+## Predictive modeling
+
+The prediction target was whether an operated departure was delayed by 15 or
+more minutes. Predictors were limited to information known before departure:
+scheduled hour, day of week, carrier, destination, distance, days to the
+nearest federal holiday (capped at 7), and the weather variables described
+above at the scheduled departure hour. To reflect real use, we used a
+time-based split, training on September 2025 to May 2026 (101,238 flights,
+23.3% delayed) and testing on June to August 2026 (37,505 flights, 26.6%
+delayed). Month was therefore excluded, since the test months do not occur in
+the training data. Rare carriers and destinations were pooled, categorical
+variables were dummy-encoded and numeric variables standardized.
+
+We compared a majority-class baseline, lasso (L1-regularized) logistic
+regression, a random forest (300 trees) and gradient-boosted trees (XGBoost,
+500 trees), implemented with tidymodels [3] and the glmnet [4], ranger [5] and
+xgboost [6] packages. Hyperparameters (the lasso penalty, the number of
+variables per split and minimum node size of the forest, and the tree depth
+and learning rate of XGBoost) were tuned by 5-fold cross-validation on the
+training data using ROC-AUC. The folds were **grouped by date**, so all
+flights from the same day were in the same fold. Flights on the same day
+share the same weather and disruptions, and an initial analysis with random
+folds produced cross-validated ROC-AUC values of about 0.78 for the tree
+models that did not hold up on the test data. Each tuned model was refit on
+the full training data and evaluated once on the test months using ROC-AUC
+and the area under the precision-recall curve (PR-AUC), which is more
+informative than accuracy when delays are the minority class. We also report
+precision and recall at probability thresholds of 0.5 and 0.3.
+
+# Results
+
+## When and why departures are delayed
+
+Overall, 24.2% of operated departures left at least 15 minutes late. The
+strongest pattern was the time of day (Figure 1): the delay rate rose almost
+steadily from 6.7% at 5:00 to 43.9% at 19:00 and stayed above 40% through the
+evening. This pattern is consistent with the reported causes of delay, since
+late-arriving aircraft accounted for 46.9% of all delay minutes, followed by
+carrier causes (30.3%) and the National Aviation System (20.0%), while
+extreme weather accounted for only 2.7% (Appendix, Figure 5). Delay rates
+also varied by season, with the highest rates in July (30.2%) and August
+(27.9%), and by carrier: among the large carriers, rates ranged from 19.0%
+for United to 36.2% for Southwest and 38.0% for Spirit, and the differences
+between carriers were highly significant (chi-square = 1639.9, df = 11,
+p < 0.001; Appendix, Figure 4).
+
+```{r fig-hour, fig.cap = "Share of operated BOS departures delayed by 15 or more minutes by scheduled departure hour (September 2025 to August 2026). Point size shows the number of departures; hours with fewer than 100 departures are omitted."}
+op %>%
+  group_by(crs_dep_hour) %>%
+  summarise(n = n(), rate = mean(dep_del15)) %>%
+  filter(n >= 100) %>%
+  ggplot(aes(crs_dep_hour, rate)) +
+  geom_line(colour = "grey60") +
+  geom_point(aes(size = n), colour = "#2c7fb8") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(5, 22, by = 2)) +
+  scale_size_area(max_size = 3.5, labels = comma) +
+  labs(x = "Scheduled departure hour (local time)",
+       y = "Delayed 15+ min", size = "Departures")
+```
+
+## Effect of weather
+
+Every adverse weather condition at the scheduled departure hour was
+associated with a higher delay rate (Figure 2). Departures during
+precipitation were delayed 36.3% of the time compared with 22.2% in dry
+conditions, a difference of 14.1 percentage points (95% CI 13.4 to 14.9;
+p < 0.001). The rate was 42.7% during snow and 38.9% during fog or mist. In
+the logistic regression adjusting for time of day, month and carrier,
+precipitation increased the odds of a delay by 80% (odds ratio 1.80, 95% CI
+1.73 to 1.88), with further increases for snow (1.36), fog or mist (1.51),
+visibility below 5 km (1.15) and each additional meter per second of wind
+(1.03); all were significant (Appendix, Table 2).
+
+```{r fig-weather, fig.height = 2.6, fig.cap = "Delay rate of operated BOS departures when each weather condition was or was not present at the scheduled departure hour, with 95\\% confidence intervals."}
+conditions <- c(any_precip = "Any precipitation", rain = "Rain",
+                snow = "Snow", fog_mist = "Fog or mist",
+                low_vis = "Visibility < 5 km", strong_wind = "Wind >= 10 m/s")
+
+op %>%
+  mutate(low_vis = as.integer(visibility_km < 5),
+         strong_wind = as.integer(wind_speed_ms >= 10)) %>%
+  select(dep_del15, all_of(names(conditions))) %>%
+  pivot_longer(-dep_del15, names_to = "condition", values_to = "present") %>%
+  group_by(condition, present) %>%
+  summarise(n = n(), rate = mean(dep_del15), .groups = "drop") %>%
+  mutate(se = sqrt(rate * (1 - rate) / n),
+         condition = factor(conditions[condition], levels = rev(conditions)),
+         present = if_else(present == 1, "Present", "Absent")) %>%
+  ggplot(aes(rate, condition, colour = present)) +
+  geom_errorbarh(aes(xmin = rate - 1.96 * se, xmax = rate + 1.96 * se),
+                 height = 0.25) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(Absent = "grey50", Present = "#d95f02")) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = "Delayed 15+ min", y = NULL, colour = "Condition")
+```
+
+## Predicting delays
+
+All three models clearly outperformed the baseline on the test months
+(Table 1, Figure 3). XGBoost achieved the highest ROC-AUC (0.745) and PR-AUC
+(0.543, about twice the no-skill value of 0.266), but the lasso logistic
+regression was almost as good (ROC-AUC 0.743), and the random forest was
+slightly weaker (0.733). With date-grouped folds, the cross-validated ROC-AUC
+on the training months (0.723 to 0.742) closely matched the test results. At
+the default threshold of 0.5, the models flagged few flights (recall of 10.5%
+for the lasso and 30.0% for XGBoost). At a threshold of 0.3, XGBoost detected
+53.4% of the delayed departures (5,318 of 9,968) with a precision of 50.7%.
+Its accuracy of 73.8% was barely above the 73.4% obtained by always
+predicting "on time", which illustrates why accuracy is not a useful measure
+here. The scheduled departure hour was by far the most important predictor,
+accounting for roughly 40% of XGBoost's total gain, followed by relative
+humidity, temperature, dew point, visibility and distance (Appendix,
+Figure 6).
+
+```{r tab-models}
+res$test_preds %>%
+  group_by(model) %>%
+  summarise(roc_auc = roc_auc_vec(delayed, .pred_delayed),
+            pr_auc = pr_auc_vec(delayed, .pred_delayed)) %>%
+  mutate(pr_auc = if_else(model == "Baseline", res$test_delay_rate, pr_auc)) %>%
+  left_join(res$cv %>% select(model, cv_auc = mean), by = "model") %>%
+  arrange(desc(roc_auc)) %>%
+  select(model, cv_auc, roc_auc, pr_auc) %>%
+  knitr::kable(format = "latex", booktabs = TRUE, digits = 3,
+               col.names = c("Model", "CV ROC-AUC (training)",
+                             "Test ROC-AUC", "Test PR-AUC"),
+               caption = paste("Cross-validated (grouped by date) and test",
+                               "performance; test period June to August 2026."))
+```
+
+```{r fig-roc, fig.height = 3, fig.width = 4.5, out.width = "65%", fig.cap = "ROC curves of the three models on the test months (June to August 2026). The dashed line corresponds to the baseline."}
+res$test_preds %>%
+  filter(model != "Baseline") %>%
+  group_by(model) %>%
+  roc_curve(delayed, .pred_delayed) %>%
+  ggplot(aes(1 - specificity, sensitivity, colour = model)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_path(linewidth = 0.8) +
+  coord_equal() +
+  labs(x = "False positive rate", y = "True positive rate", colour = NULL)
+```
+
+# Discussion
+
+The project answered its three questions. Departure delays at BOS are driven
+mainly by when a flight is scheduled: the risk of a delay increases more than
+sixfold from the first departures of the morning to the evening, and almost
+half of all delay minutes come from aircraft arriving late from earlier
+flights. For travelers, the practical implication is simple: early-morning
+departures are by far the most reliable. For airlines and the airport, the
+results point to delay propagation as the main lever, for example through
+larger schedule buffers in the afternoon and evening. Weather matters as
+well: precipitation, snow, fog and low visibility each raise the delay rate
+substantially, even after accounting for time of day, season and airline,
+although BTS attributes only 2.7% of delay minutes to "extreme weather". This
+suggests that most weather-related delays are recorded under the National
+Aviation System category, so the official cause categories understate the
+role of everyday weather.
+
+The predictive models showed that delays are only partly predictable from
+information available before departure: the best model detects about half of
+the delayed flights, and about half of its warnings are correct. Such a model
+could support decisions where moderate accuracy is useful, such as
+prioritizing passenger notifications or staffing on high-risk days, but it
+would not be reliable enough to inform individual passengers with certainty.
+The finding that a regularized logistic regression performs almost as well
+as gradient-boosted trees indicates that most of the predictable signal is
+captured by a few simple relationships, which favors the interpretable
+model. Methodologically, the comparison of random and date-grouped
+cross-validation shows that flights on the same day cannot be treated as
+independent observations, a point that applies to any model evaluated on
+such data.
+
+The study has several limitations. The models do not use the delay of the
+inbound aircraft, even though late-arriving aircraft cause almost half of
+all delay minutes; linking each departure to the previous flight of the same
+aircraft through its tail number is the most promising extension. Weather is
+measured only at BOS, not at the destination or elsewhere in the national
+system. Month could not be used as a predictor with a time-based split, and
+the summer test months had more delays than the training months. Finally,
+the analysis covers one airport and one year, so the results may not
+generalize to other airports or years with different schedules.
+
+# Statement of contributions
+
+- **Naman Jain:** collected the BTS flight data and wrote the download and
+  filtering scripts, built the SQLite database and the SQL join of flights
+  and weather, and set up the GitHub repository.
+- **Yash Rahul Kava:** proposed the project topic, drafted the project
+  proposal, researched background information on flight delays, and wrote
+  the Introduction.
+- **Sanket Kothari:** obtained and cleaned the NOAA weather data, handled the
+  time-zone alignment between flights and weather, wrote the Methods section,
+  and tested the reproducibility of the analysis.
+- **Jinam Shah:** carried out the exploratory data analysis and the
+  statistical inference (tests of proportions, chi-square test and logistic
+  regression), created the corresponding figures, and wrote the Results
+  section.
+- **Sai Rishin Bussa:** built and tuned the predictive models, evaluated them
+  on the test period (ROC and precision-recall analysis, decision thresholds
+  and feature importance), and wrote the Discussion.
+
+All team members reviewed the final report and presented in the in-class
+presentation.
+
+# References
+
+[1] Bureau of Transportation Statistics. *Reporting Carrier On-Time
+Performance (1987-present)*. U.S. Department of Transportation.
+https://www.transtats.bts.gov
+
+[2] National Centers for Environmental Information. *Local Climatological
+Data Version 2 (LCDv2) Dataset Documentation*. National Oceanic and
+Atmospheric Administration.
+https://www.ncei.noaa.gov/products/land-based-station/local-climatological-data
+
+[3] Kuhn, M. and Wickham, H. (2020). *Tidymodels: A Collection of Packages
+for Modeling and Machine Learning Using Tidyverse Principles*.
+https://www.tidymodels.org
+
+[4] Friedman, J., Hastie, T. and Tibshirani, R. (2010). Regularization paths
+for generalized linear models via coordinate descent. *Journal of
+Statistical Software*, 33(1), 1-22.
+
+[5] Wright, M. N. and Ziegler, A. (2017). ranger: A fast implementation of
+random forests for high dimensional data in C++ and R. *Journal of
+Statistical Software*, 77(1), 1-17.
+
+[6] Chen, T. and Guestrin, C. (2016). XGBoost: A scalable tree boosting
+system. In *Proceedings of the 22nd ACM SIGKDD International Conference on
+Knowledge Discovery and Data Mining*, 785-794.
+
+\newpage
+
+# Appendix
+
+```{r fig-carrier, fig.height = 3.2, fig.cap = "Delay rate by carrier with 95\\% confidence intervals (carriers with at least 500 operated BOS departures). The dashed line marks the overall rate."}
+op %>%
+  group_by(carrier_name) %>%
+  summarise(n = n(), rate = mean(dep_del15)) %>%
+  filter(n >= 500) %>%
+  mutate(se = sqrt(rate * (1 - rate) / n),
+         carrier_name = fct_reorder(carrier_name, rate)) %>%
+  ggplot(aes(rate, carrier_name)) +
+  geom_vline(xintercept = mean(op$dep_del15), linetype = "dashed",
+             colour = "grey50") +
+  geom_errorbarh(aes(xmin = rate - 1.96 * se, xmax = rate + 1.96 * se),
+                 height = 0.3, colour = "grey40") +
+  geom_point(colour = "#2c7fb8", size = 2) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = "Delayed 15+ min", y = NULL)
+```
+
+```{r fig-causes, fig.height = 2.2, fig.cap = "Share of delay minutes by cause for delayed BOS departures, as reported to BTS."}
+fw %>%
+  filter(cancelled == 0, dep_del15 == 1) %>%
+  select(carrier_delay, weather_delay, nas_delay, security_delay,
+         late_aircraft_delay) %>%
+  pivot_longer(everything(), names_to = "cause", values_to = "minutes") %>%
+  group_by(cause) %>%
+  summarise(minutes = sum(minutes, na.rm = TRUE)) %>%
+  mutate(share = minutes / sum(minutes),
+         cause = recode(cause, carrier_delay = "Carrier",
+                        weather_delay = "Extreme weather",
+                        nas_delay = "National Aviation System",
+                        security_delay = "Security",
+                        late_aircraft_delay = "Late-arriving aircraft"),
+         cause = fct_reorder(cause, share)) %>%
+  ggplot(aes(share, cause)) +
+  geom_col(fill = "#2c7fb8", width = 0.6) +
+  geom_text(aes(label = percent(share, accuracy = 0.1)), hjust = -0.15,
+            size = 3) +
+  scale_x_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 0.55)) +
+  labs(x = "Share of delay minutes", y = NULL)
+```
+
+```{r fig-importance, fig.height = 3.2, fig.cap = "Top 15 predictors of the XGBoost model by share of total gain."}
+feature_labels <- c(
+  crs_dep_hour = "Scheduled departure hour", rel_humidity = "Relative humidity",
+  temp_c = "Temperature", dew_point_c = "Dew point",
+  visibility_km = "Visibility", distance = "Distance",
+  days_to_holiday = "Days to holiday", wind_speed_ms = "Wind speed",
+  wind_gust_ms = "Wind gust", precip_mm = "Precipitation amount",
+  any_precip = "Any precipitation", rain = "Rain", snow = "Snow",
+  fog_mist = "Fog or mist", thunder = "Thunderstorm")
+
+res$importance %>%
+  slice_max(Gain, n = 15) %>%
+  mutate(Feature = case_when(
+    Feature %in% names(feature_labels) ~ feature_labels[Feature],
+    str_detect(Feature, "^carrier_") ~
+      paste("Carrier:", str_remove(Feature, "^carrier_")),
+    str_detect(Feature, "^day_of_week_") ~
+      paste("Day:", str_remove(Feature, "^day_of_week_")),
+    str_detect(Feature, "^dest_") ~
+      paste("Destination:", str_remove(Feature, "^dest_")),
+    TRUE ~ Feature)) %>%
+  ggplot(aes(Gain, fct_reorder(Feature, Gain))) +
+  geom_col(fill = "#2c7fb8", width = 0.7) +
+  labs(x = "Share of total gain", y = NULL)
+```
+
+```{r tab-logit}
+logit_data <- op %>%
+  mutate(hour_block = cut(crs_dep_hour, breaks = c(0, 9, 12, 15, 18, 24),
+                          right = FALSE),
+         month = factor(month),
+         low_vis = as.integer(visibility_km < 5))
+
+logit <- glm(dep_del15 ~ hour_block + month + carrier + any_precip + snow +
+               fog_mist + low_vis + wind_speed_ms,
+             data = logit_data, family = binomial)
+
+broom::tidy(logit) %>%
+  filter(term %in% c("any_precip", "snow", "fog_mist", "low_vis",
+                     "wind_speed_ms")) %>%
+  transmute(Variable = recode(term, any_precip = "Any precipitation",
+                              snow = "Snow (in addition)",
+                              fog_mist = "Fog or mist",
+                              low_vis = "Visibility < 5 km",
+                              wind_speed_ms = "Wind speed (per m/s)"),
+            `Odds ratio` = exp(estimate),
+            `95% CI low` = exp(estimate - 1.96 * std.error),
+            `95% CI high` = exp(estimate + 1.96 * std.error),
+            `p-value` = pvalue(p.value)) %>%
+  knitr::kable(format = "latex", booktabs = TRUE, digits = 3,
+               caption = paste("Adjusted odds ratios of a 15+ minute",
+                               "delay for weather variables, from a logistic",
+                               "regression that also includes departure-time",
+                               "block, month and carrier."))
+```
